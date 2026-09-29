@@ -248,7 +248,7 @@ func runStreamAttempt(req pluginapi.ExecutorRequest, body []byte, callbackID, pl
 }
 
 func hostModelExecute(req pluginapi.ExecutorRequest, body []byte, callbackID string) (pluginapi.HostModelExecutionResponse, error) {
-	raw, err := callHost(pluginabi.MethodHostModelExecute, hostModelExecutionRequest{HostModelExecutionRequest: pluginapi.HostModelExecutionRequest{EntryProtocol: "openai-response", ExitProtocol: "openai-response", Model: req.Model, Stream: false, Body: body, Headers: req.Headers, Query: req.Query, ForcedProvider: loadedConfig().Provider}, HostCallbackID: callbackID})
+	raw, err := callHost(pluginabi.MethodHostModelExecute, hostModelExecutionRequest{HostModelExecutionRequest: pluginapi.HostModelExecutionRequest{EntryProtocol: "openai-response", ExitProtocol: "openai-response", Model: req.Model, Stream: false, Body: body, Headers: req.Headers, Query: req.Query, ForcedProvider: loadedConfig().Provider, AuthID: req.AuthID}, HostCallbackID: callbackID})
 	if err != nil {
 		return pluginapi.HostModelExecutionResponse{}, err
 	}
