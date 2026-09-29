@@ -8,7 +8,7 @@ import (
 )
 
 func routeModel(raw []byte) ([]byte, error) {
-	var req pluginapi.ModelRouteRequest
+	var req rpcModelRouteRequest
 	if err := json.Unmarshal(raw, &req); err != nil {
 		return nil, err
 	}
@@ -19,6 +19,7 @@ func routeModel(raw []byte) ([]byte, error) {
 	if !providerAvailable(req.AvailableProviders, cfg.Provider) {
 		return okEnvelope(pluginapi.ModelRouteResponse{Handled: false})
 	}
+	logRouteSelection(req.HostCallbackID, "router", req.RequestedModel)
 	return okEnvelope(pluginapi.ModelRouteResponse{Handled: true, TargetKind: pluginapi.ModelRouteTargetSelf, Reason: "codex_server_overload_recovery"})
 }
 
@@ -43,7 +44,7 @@ func providerAvailable(providers []string, wanted string) bool {
 
 func modelAllowed(model string, allowlist []string) bool {
 	if len(allowlist) == 0 {
-		return true
+		return false
 	}
 	model = strings.TrimSpace(model)
 	for _, allowed := range allowlist {

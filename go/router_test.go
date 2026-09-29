@@ -44,3 +44,27 @@ func TestRouteModelDeclinesOtherSourceOrProvider(t *testing.T) {
 		}
 	}
 }
+
+func TestRouteModelEmptyAllowlistDoesNotMatchEnabledConfig(t *testing.T) {
+	currentConfig.Store(pluginConfig{Enabled: true, Provider: "codex"})
+	if err := configure(configRequest("enabled: true\n")); err == nil {
+		t.Fatal("enabled empty allowlist should be rejected")
+	}
+	currentConfig.Store(pluginConfig{Enabled: true, Provider: "codex"})
+	raw, _ := json.Marshal(pluginapi.ModelRouteRequest{SourceFormat: "openai-response", RequestedModel: "gpt-6-astra", AvailableProviders: []string{"codex"}})
+	result, err := routeModel(raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var env envelope
+	if err := json.Unmarshal(result, &env); err != nil {
+		t.Fatal(err)
+	}
+	var decision pluginapi.ModelRouteResponse
+	if err := json.Unmarshal(env.Result, &decision); err != nil {
+		t.Fatal(err)
+	}
+	if decision.Handled {
+		t.Fatalf("empty allowlist must not route: %#v", decision)
+	}
+}

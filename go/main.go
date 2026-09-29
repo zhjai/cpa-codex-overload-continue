@@ -47,6 +47,7 @@ static void free_host_buffer(void* ptr, size_t len) {
 import "C"
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"net/http"
@@ -85,16 +86,15 @@ type lifecycleRequest struct {
 	ConfigYAML []byte `json:"config_yaml"`
 }
 
-// pluginConfig deliberately requires an explicit allowlist in production. An empty
-// allowlist means all openai-response models, which is useful for a local test only.
+// Models is a required allowlist whenever the plugin is enabled. This prevents
+// the executor from claiming unrelated openai-response models in the same CPA.
 type pluginConfig struct {
 	Enabled             bool     `yaml:"enabled"`
+	Priority            int      `yaml:"priority"`
 	Provider            string   `yaml:"provider"`
 	Models              []string `yaml:"models"`
 	PostOutputCapacity  string   `yaml:"post_output_capacity"`
 	MaxPreOutputRetries int      `yaml:"max_pre_output_retries"`
-	BackoffBaseMS       int      `yaml:"backoff_base_ms"`
-	BackoffMaxMS        int      `yaml:"backoff_max_ms"`
 }
 
 var currentConfig atomic.Value
@@ -103,6 +103,27 @@ type rpcExecutorRequest struct {
 	pluginapi.ExecutorRequest
 	StreamID       string `json:"stream_id,omitempty"`
 	HostCallbackID string `json:"host_callback_id,omitempty"`
+}
+
+type rpcModelRouteRequest struct {
+	pluginapi.ModelRouteRequest
+	HostCallbackID string `json:"host_callback_id,omitempty"`
+}
+
+type hostLogRequest struct {
+	HostCallbackID string         `json:"host_callback_id,omitempty"`
+	Level          string         `json:"level"`
+	Message        string         `json:"message"`
+	Fields         map[string]any `json:"fields"`
+}
+
+func logRouteSelection(callbackID, stage, model string) {
+	_, _ = callHost(pluginabi.MethodHostLog, hostLogRequest{
+		HostCallbackID: callbackID,
+		Level:          "info",
+		Message:        fmt.Sprintf("codex-overload-continue route selected stage=%s", stage),
+		Fields:         map[string]any{"plugin_id": pluginIdentifier, "stage": stage, "model": model},
+	})
 }
 
 type rpcStreamEmitRequest struct {
@@ -137,14 +158,22 @@ func (e *hostRPCError) Error() string {
 	return e.Code + ": " + e.Message
 }
 
+func hostErrorPayload(err error) string {
+	if e, ok := err.(*hostRPCError); ok && e != nil {
+		message := strings.TrimSpace(e.Message)
+		if strings.HasPrefix(message, "{") || strings.HasPrefix(message, "[") {
+			return message
+		}
+	}
+	return ""
+}
+
 func defaultConfig() pluginConfig {
 	return pluginConfig{
 		Enabled:             false,
 		Provider:            "codex",
 		PostOutputCapacity:  "fail_closed",
 		MaxPreOutputRetries: 0,
-		BackoffBaseMS:       250,
-		BackoffMaxMS:        4000,
 	}
 }
 
@@ -172,12 +201,14 @@ func configure(raw []byte) error {
 		if err := yaml.Unmarshal(configYAML, &fields); err != nil {
 			return err
 		}
-		for _, legacy := range []string{"max_pre_commit_retries", "max_continuations", "continuation_mode", "continue_prompt", "rewrite_response_id"} {
+		for _, legacy := range []string{"max_pre_commit_retries", "max_continuations", "continuation_mode", "continue_prompt", "rewrite_response_id", "backoff_base_ms", "backoff_max_ms"} {
 			if _, exists := fields[legacy]; exists {
 				return fmt.Errorf("legacy field %q is not supported; use post_output_capacity and max_pre_output_retries", legacy)
 			}
 		}
-		if err := yaml.Unmarshal(configYAML, &cfg); err != nil {
+		decoder := yaml.NewDecoder(bytes.NewReader(configYAML))
+		decoder.KnownFields(true)
+		if err := decoder.Decode(&cfg); err != nil {
 			return err
 		}
 	}
@@ -192,17 +223,11 @@ func configure(raw []byte) error {
 	if cfg.PostOutputCapacity != "fail_closed" && cfg.PostOutputCapacity != "text_only" {
 		return fmt.Errorf("post_output_capacity must be fail_closed or text_only")
 	}
-	if cfg.MaxPreOutputRetries < 0 || cfg.MaxPreOutputRetries > 1 {
-		return fmt.Errorf("max_pre_output_retries must be between 0 and 1")
+	if cfg.MaxPreOutputRetries != 0 {
+		return fmt.Errorf("max_pre_output_retries must be 0; use CPA stream bootstrap buffering and credential failover")
 	}
 	if cfg.Enabled && len(cfg.Models) == 0 {
 		return fmt.Errorf("models must be non-empty when the plugin is enabled")
-	}
-	if cfg.BackoffBaseMS < 0 || cfg.BackoffMaxMS < cfg.BackoffBaseMS {
-		return fmt.Errorf("invalid backoff bounds")
-	}
-	if cfg.BackoffMaxMS == 0 {
-		cfg.BackoffMaxMS = 4000
 	}
 	currentConfig.Store(cfg)
 	return nil
@@ -212,16 +237,14 @@ func pluginRegistration() registration {
 	return registration{
 		SchemaVersion: pluginabi.SchemaVersion,
 		Metadata: pluginapi.Metadata{
-			Name: pluginIdentifier, Version: "0.2.0", Author: "zhjai",
+			Name: pluginIdentifier, Version: "0.2.1", Author: "zhjai",
 			GitHubRepository: "https://github.com/zhjai/cpa-codex-overload-continue",
 			ConfigFields: []pluginapi.ConfigField{
 				{Name: "enabled", Type: pluginapi.ConfigFieldTypeBoolean, Description: "Enable the opt-in Codex overload recovery router."},
 				{Name: "provider", Type: pluginapi.ConfigFieldTypeString, Description: "Provider forced for nested execution; normally codex."},
-				{Name: "models", Type: pluginapi.ConfigFieldTypeArray, Description: "Model allowlist. Empty matches every openai-response model."},
-				{Name: "post_output_capacity", Type: pluginapi.ConfigFieldTypeEnum, EnumValues: []string{"fail_closed", "text_only"}, Description: "Post-output capacity handling. text_only rewrites only safe text responses; fail_closed preserves the upstream error."},
-				{Name: "max_pre_output_retries", Type: pluginapi.ConfigFieldTypeInteger, Description: "Optional plugin-level retries before any stream chunk is forwarded; CPA host buffering/failover remains preferred."},
-				{Name: "backoff_base_ms", Type: pluginapi.ConfigFieldTypeInteger, Description: "Initial retry backoff in milliseconds."},
-				{Name: "backoff_max_ms", Type: pluginapi.ConfigFieldTypeInteger, Description: "Maximum retry backoff in milliseconds."},
+				{Name: "models", Type: pluginapi.ConfigFieldTypeArray, Description: "Required model allowlist. The plugin rejects enabled configuration without models."},
+				{Name: "post_output_capacity", Type: pluginapi.ConfigFieldTypeEnum, EnumValues: []string{"fail_closed", "text_only"}, Description: "Post-output capacity handling. text_only rewrites only plain-text-only output; fail_closed preserves the upstream error."},
+				{Name: "max_pre_output_retries", Type: pluginapi.ConfigFieldTypeInteger, Description: "Must be 0; use CPA host buffering and credential failover before plugin execution."},
 			},
 		},
 		Capabilities: registrationCaps{
@@ -265,7 +288,7 @@ func handleMethod(method string, raw []byte) ([]byte, error) {
 	case pluginabi.MethodExecutorExecuteStream:
 		return executeStream(raw)
 	case pluginabi.MethodExecutorCountTokens:
-		return okEnvelope(pluginapi.ExecutorResponse{Payload: []byte(`{"input_tokens":0}`)})
+		return errorEnvelope("unsupported_operation", "Codex token counting is not available through the plugin executor API", http.StatusNotImplemented), nil
 	default:
 		return errorEnvelope("unknown_method", "unknown method: "+method, http.StatusInternalServerError), nil
 	}
@@ -387,8 +410,8 @@ func hostModelRequest(req pluginapi.ExecutorRequest, body []byte, callbackID str
 	return hostModelExecutionRequest{
 		HostModelExecutionRequest: pluginapi.HostModelExecutionRequest{
 			EntryProtocol: "openai-response", ExitProtocol: "openai-response", Model: req.Model,
-			Stream: true, Body: body, Headers: req.Headers, Query: req.Query,
-			ForcedProvider: loadedConfig().Provider, AuthID: req.AuthID,
+			Stream: true, Body: body, Headers: req.Headers, Query: req.Query, Alt: req.Alt,
+			ForcedProvider: loadedConfig().Provider,
 		},
 		HostCallbackID: callbackID,
 	}
