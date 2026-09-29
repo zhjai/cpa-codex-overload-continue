@@ -208,7 +208,7 @@ func pluginRegistration() registration {
 		SchemaVersion: pluginabi.SchemaVersion,
 		Metadata: pluginapi.Metadata{
 			Name: pluginIdentifier, Version: "0.1.0", Author: "zhjai",
-			GitHubRepository: "https://github.com/router-for-me/CLIProxyAPI",
+			GitHubRepository: "https://github.com/zhjai/cpa-codex-overload-continue",
 			ConfigFields: []pluginapi.ConfigField{
 				{Name: "enabled", Type: pluginapi.ConfigFieldTypeBoolean, Description: "Enable the opt-in Codex overload recovery router."},
 				{Name: "provider", Type: pluginapi.ConfigFieldTypeString, Description: "Provider forced for nested execution; normally codex."},
