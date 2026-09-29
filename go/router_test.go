@@ -4,11 +4,11 @@ import (
 	"encoding/json"
 	"testing"
 
-	"github.com/router-for-me/CLIProxyAPI/v7/sdk/pluginapi"
+	"github.com/router-for-me/CLIProxyAPI/v8/sdk/pluginapi"
 )
 
 func TestRouteModelOnlyMatchesEnabledOpenAIResponsesCodex(t *testing.T) {
-	currentConfig.Store(pluginConfig{Enabled: true, Provider: "codex", MaxPreCommitRetries: 2, ContinuationMode: "text"})
+	currentConfig.Store(pluginConfig{Enabled: true, Provider: "codex", Models: []string{"gpt-5.5"}, PostOutputCapacity: "fail_closed"})
 	raw, _ := json.Marshal(pluginapi.ModelRouteRequest{SourceFormat: "openai-response", RequestedModel: "gpt-5.5", AvailableProviders: []string{"codex"}})
 	got, err := routeModel(raw)
 	if err != nil {
@@ -28,7 +28,7 @@ func TestRouteModelOnlyMatchesEnabledOpenAIResponsesCodex(t *testing.T) {
 }
 
 func TestRouteModelDeclinesOtherSourceOrProvider(t *testing.T) {
-	currentConfig.Store(pluginConfig{Enabled: true, Provider: "codex"})
+	currentConfig.Store(pluginConfig{Enabled: true, Provider: "codex", Models: []string{"*"}})
 	for _, req := range []pluginapi.ModelRouteRequest{{SourceFormat: "openai", RequestedModel: "gpt-5.5", AvailableProviders: []string{"codex"}}, {SourceFormat: "openai-response", RequestedModel: "gpt-5.5", AvailableProviders: []string{"openai"}}} {
 		raw, _ := json.Marshal(req)
 		out, err := routeModel(raw)

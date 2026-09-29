@@ -9,8 +9,8 @@ import (
 	"strings"
 	"time"
 
-	"github.com/router-for-me/CLIProxyAPI/v7/sdk/pluginabi"
-	"github.com/router-for-me/CLIProxyAPI/v7/sdk/pluginapi"
+	"github.com/router-for-me/CLIProxyAPI/v8/sdk/pluginabi"
+	"github.com/router-for-me/CLIProxyAPI/v8/sdk/pluginapi"
 )
 
 type sseFrame struct {
@@ -19,9 +19,6 @@ type sseFrame struct {
 	EventType string
 }
 
-// sseDecoder keeps incomplete events across host stream reads. Host chunks are
-// transport chunks, not SSE message boundaries, so parsing each chunk in
-// isolation can otherwise hide an overload or split a delta.
 type sseDecoder struct{ buffer []byte }
 
 func (d *sseDecoder) feed(payload []byte, final bool) []sseFrame {
@@ -51,18 +48,27 @@ func (d *sseDecoder) feed(payload []byte, final bool) []sseFrame {
 }
 
 type attemptState struct {
-	Generated  bool
-	ToolCall   bool
-	TextOutput bool
-	Overloaded bool
-	ResponseID string
-	Partial    strings.Builder
+	Generated      bool
+	ToolCall       bool
+	Forwarded      bool
+	SemanticOutput bool
+	Overloaded     bool
 }
+
 type streamAttemptResult struct {
-	State  attemptState
-	Status int
-	Err    error
+	State          attemptState
+	Status         int
+	Err            error
+	ClosePayload   string
+	StopAfterFrame bool
 }
+
+// streamFailure carries a structured payload to host.stream.close. A free-form
+// error string makes CPA synthesize a generic error and can accidentally turn a
+// tool-side failure into a client retry.
+type streamFailure struct{ message, payload string }
+
+func (e *streamFailure) Error() string { return e.message }
 
 func execute(raw []byte) ([]byte, error) {
 	var req rpcExecutorRequest
@@ -77,7 +83,7 @@ func execute(raw []byte) ([]byte, error) {
 	var lastErr error
 	for attempt := 0; ; attempt++ {
 		resp, err := hostModelExecute(req.ExecutorRequest, body, req.HostCallbackID)
-		if err == nil && !responseBodyIsOverload(resp.Body) && resp.StatusCode < 500 {
+		if err == nil && resp.StatusCode < 400 {
 			return okEnvelope(pluginapi.ExecutorResponse{Payload: resp.Body, Headers: resp.Headers})
 		}
 		if err != nil {
@@ -85,15 +91,19 @@ func execute(raw []byte) ([]byte, error) {
 		} else {
 			lastErr = fmt.Errorf("upstream status %d", resp.StatusCode)
 		}
-		if !isOverloadError(resp.Body, resp.StatusCode, err) || attempt >= cfg.MaxPreCommitRetries {
-			break
+		if isOverloadError(resp.Body, resp.StatusCode, err) && attempt < cfg.MaxPreOutputRetries {
+			if waitErr := waitBackoff(context.Background(), attempt, cfg); waitErr != nil {
+				lastErr = waitErr
+				break
+			}
+			continue
 		}
-		if errBackoff := waitBackoff(context.Background(), attempt, cfg); errBackoff != nil {
-			lastErr = errBackoff
-			break
+		if isOverloadError(resp.Body, resp.StatusCode, err) {
+			return errorEnvelope("server_is_overloaded", lastErr.Error(), http.StatusServiceUnavailable), nil
 		}
+		return errorEnvelope("upstream_error", lastErr.Error(), hostErrorStatus(err)), nil
 	}
-	return errorEnvelope("server_is_overloaded", fmt.Sprintf("Codex upstream remained overloaded after bounded retry: %v", lastErr), http.StatusServiceUnavailable), nil
+	return errorEnvelope("upstream_error", lastErr.Error(), hostErrorStatus(lastErr)), nil
 }
 
 func executeStream(raw []byte) ([]byte, error) {
@@ -106,7 +116,11 @@ func executeStream(raw []byte) ([]byte, error) {
 	}
 	go func() {
 		if err := runStream(req); err != nil {
-			closePluginStream(req.StreamID, err.Error())
+			if failure, ok := err.(*streamFailure); ok && failure.payload != "" {
+				closePluginStream(req.StreamID, failure.payload)
+				return
+			}
+			closePluginStream(req.StreamID, originalFailurePayload(err.Error()))
 			return
 		}
 		closePluginStream(req.StreamID, "")
@@ -118,133 +132,163 @@ func runStream(req rpcExecutorRequest) error {
 	cfg := loadedConfig()
 	body := requestBody(req.ExecutorRequest)
 	if len(body) == 0 {
-		return fmt.Errorf("empty Responses request")
+		return &streamFailure{message: "empty Responses request", payload: canonicalUpstreamError("empty Responses request")}
 	}
 	for attempt := 0; ; attempt++ {
-		result := runStreamAttempt(req.ExecutorRequest, body, req.HostCallbackID, req.StreamID, cfg, false, "")
+		result := runStreamAttempt(req.ExecutorRequest, body, req.HostCallbackID, req.StreamID, cfg)
 		if result.Err == nil {
 			return nil
+		}
+		if result.StopAfterFrame {
+			return nil
+		}
+		if result.ClosePayload != "" {
+			return &streamFailure{message: result.Err.Error(), payload: result.ClosePayload}
 		}
 		if !result.State.Overloaded {
 			return result.Err
 		}
-		if !result.State.Generated && !result.State.ToolCall && attempt < cfg.MaxPreCommitRetries {
+		if !result.State.SemanticOutput && !result.State.ToolCall && !result.State.Forwarded && attempt < cfg.MaxPreOutputRetries {
 			if err := waitBackoff(context.Background(), attempt, cfg); err != nil {
 				return err
 			}
 			continue
 		}
-		if result.State.TextOutput && !result.State.ToolCall && cfg.ContinuationMode == "text" && cfg.MaxContinuations > 0 {
-			continuationBody, err := buildContinuationBody(body, result.State.Partial.String(), cfg.ContinuePrompt)
-			if err != nil {
-				return fmt.Errorf("safe continuation unavailable: %w", err)
-			}
-			cont := runStreamAttempt(req.ExecutorRequest, continuationBody, req.HostCallbackID, req.StreamID, cfg, true, result.State.ResponseID)
-			if cont.Err == nil {
-				return nil
-			}
-			return fmt.Errorf("continuation failed: %w", cont.Err)
-		}
-		return fmt.Errorf("server_is_overloaded: generated output or side effects prevent safe replay")
+		return &streamFailure{message: result.Err.Error(), payload: originalFailurePayload(result.Err.Error())}
 	}
 }
 
-func runStreamAttempt(req pluginapi.ExecutorRequest, body []byte, callbackID, pluginStreamID string, cfg pluginConfig, continuation bool, responseIDOverride string) streamAttemptResult {
+func runStreamAttempt(req pluginapi.ExecutorRequest, body []byte, callbackID, pluginStreamID string, cfg pluginConfig) streamAttemptResult {
 	state := attemptState{}
 	resp, err := hostModelExecuteStream(req, body, callbackID)
 	if err != nil {
 		state.Overloaded = isOverloadError(nil, hostErrorStatus(err), err)
-		return streamAttemptResult{State: state, Status: hostErrorStatus(err), Err: err}
+		payload := closePayloadForError(err.Error(), state, cfg)
+		if state.Overloaded && !streamCommitted(state) {
+			payload = ""
+		}
+		return streamAttemptResult{State: state, Status: hostErrorStatus(err), Err: err, ClosePayload: payload}
 	}
 	if resp.StatusCode >= 400 {
 		state.Overloaded = isOverloadError(nil, resp.StatusCode, nil)
-		return streamAttemptResult{State: state, Status: resp.StatusCode, Err: fmt.Errorf("upstream status %d", resp.StatusCode)}
+		err := fmt.Errorf("upstream status %d", resp.StatusCode)
+		payload := closePayloadForError(err.Error(), state, cfg)
+		if state.Overloaded && !streamCommitted(state) {
+			payload = ""
+		}
+		return streamAttemptResult{State: state, Status: resp.StatusCode, Err: err, ClosePayload: payload}
 	}
 	if resp.StreamID == "" {
 		return streamAttemptResult{State: state, Err: fmt.Errorf("host returned empty stream id")}
 	}
 	defer closeHostModelStream(resp.StreamID)
-	var bootstrap [][]byte
 	decoder := &sseDecoder{}
 	for {
 		chunk, errRead := readHostModelStream(resp.StreamID)
 		if errRead != nil {
 			state.Overloaded = isOverloadError(nil, hostErrorStatus(errRead), errRead)
-			return streamAttemptResult{State: state, Status: hostErrorStatus(errRead), Err: errRead}
+			payload := closePayloadForError(errRead.Error(), state, cfg)
+			if state.Overloaded && !streamCommitted(state) {
+				payload = ""
+			}
+			return streamAttemptResult{State: state, Status: hostErrorStatus(errRead), Err: errRead, ClosePayload: payload}
 		}
 		if chunk.Error != "" {
-			state.Overloaded = isOverloadError(nil, 0, fmt.Errorf("%s", chunk.Error))
-			return streamAttemptResult{State: state, Err: fmt.Errorf("%s", chunk.Error)}
+			return streamErrorResult(state, chunk.Error, cfg)
 		}
 		if len(chunk.Payload) > 0 {
-			frames := decoder.feed(chunk.Payload, false)
-			for _, frame := range frames {
-				observeFrame(&state, frame)
-				if state.Overloaded {
-					continue
-				}
-				if continuation && state.ToolCall {
-					return streamAttemptResult{State: state, Err: fmt.Errorf("continuation produced a tool call; refusing side effects")}
-				}
-				payload := frame.Raw
-				if continuation && cfg.RewriteResponseID && responseIDOverride != "" {
-					payload = rewriteResponseID(frame.Raw, responseIDOverride)
-				}
-				if !state.Generated && !state.ToolCall && frame.EventType != "response.completed" {
-					bootstrap = append(bootstrap, payload)
-					continue
-				}
-				if state.Generated || state.ToolCall || frame.EventType == "response.completed" {
-					for _, pending := range bootstrap {
-						if err := emitPluginStreamChunk(pluginStreamID, pending); err != nil {
-							return streamAttemptResult{State: state, Err: err}
-						}
-					}
-					bootstrap = nil
-				}
-				if err := emitPluginStreamChunk(pluginStreamID, payload); err != nil {
-					return streamAttemptResult{State: state, Err: err}
+			for _, frame := range decoder.feed(chunk.Payload, false) {
+				result, stop := forwardFrame(pluginStreamID, frame, &state, cfg)
+				if result.Err != nil || stop {
+					return result
 				}
 			}
 		}
 		if chunk.Done {
 			for _, frame := range decoder.feed(nil, true) {
-				observeFrame(&state, frame)
-				if state.Overloaded {
-					continue
-				}
-				if continuation && state.ToolCall {
-					return streamAttemptResult{State: state, Err: fmt.Errorf("continuation produced a tool call; refusing side effects")}
-				}
-				payload := frame.Raw
-				if continuation && cfg.RewriteResponseID && responseIDOverride != "" {
-					payload = rewriteResponseID(frame.Raw, responseIDOverride)
-				}
-				if !state.Generated && !state.ToolCall && frame.EventType != "response.completed" {
-					bootstrap = append(bootstrap, payload)
-					continue
-				}
-				for _, pending := range bootstrap {
-					if err := emitPluginStreamChunk(pluginStreamID, pending); err != nil {
-						return streamAttemptResult{State: state, Err: err}
-					}
-				}
-				bootstrap = nil
-				if err := emitPluginStreamChunk(pluginStreamID, payload); err != nil {
-					return streamAttemptResult{State: state, Err: err}
-				}
-			}
-			if state.Overloaded {
-				return streamAttemptResult{State: state, Err: fmt.Errorf("server_is_overloaded")}
-			}
-			for _, pending := range bootstrap {
-				if err := emitPluginStreamChunk(pluginStreamID, pending); err != nil {
-					return streamAttemptResult{State: state, Err: err}
+				result, stop := forwardFrame(pluginStreamID, frame, &state, cfg)
+				if result.Err != nil || stop {
+					return result
 				}
 			}
 			return streamAttemptResult{State: state, Status: http.StatusOK}
 		}
 	}
+}
+
+func forwardFrame(pluginStreamID string, frame sseFrame, state *attemptState, cfg pluginConfig) (streamAttemptResult, bool) {
+	if frameIsOverload(frame) {
+		state.Overloaded = true
+		if canRewriteCapacity(*state, cfg) {
+			if err := emitPluginStreamChunk(pluginStreamID, rewriteCapacitySSEFrame(frame.Raw)); err != nil {
+				return streamAttemptResult{State: *state, Err: err}, false
+			}
+			state.Forwarded = true
+			return streamAttemptResult{State: *state, Err: fmt.Errorf("capacity error rewritten as server_error"), StopAfterFrame: true}, true
+		}
+		return streamAttemptResult{State: *state, Err: fmt.Errorf("server_is_overloaded")}, false
+	}
+	observeFrame(state, frame)
+	if err := emitPluginStreamChunk(pluginStreamID, frame.Raw); err != nil {
+		return streamAttemptResult{State: *state, Err: err}, false
+	}
+	state.Forwarded = true
+	return streamAttemptResult{State: *state}, false
+}
+
+func streamErrorResult(state attemptState, raw string, cfg pluginConfig) streamAttemptResult {
+	state.Overloaded = isOverloadError(nil, 0, fmt.Errorf("%s", raw))
+	if state.Overloaded && !streamCommitted(state) {
+		return streamAttemptResult{State: state, Err: fmt.Errorf("%s", raw)}
+	}
+	return streamAttemptResult{State: state, Err: fmt.Errorf("%s", raw), ClosePayload: closePayloadForError(raw, state, cfg)}
+}
+
+func streamCommitted(state attemptState) bool {
+	return state.Forwarded || state.SemanticOutput || state.ToolCall
+}
+
+func canRewriteCapacity(state attemptState, cfg pluginConfig) bool {
+	return cfg.PostOutputCapacity == "text_only" && state.SemanticOutput && !state.ToolCall
+}
+
+func closePayloadForError(raw string, state attemptState, cfg pluginConfig) string {
+	if isOverloadError(nil, 0, fmt.Errorf("%s", raw)) && canRewriteCapacity(state, cfg) {
+		return normalizedServerErrorPayload(raw)
+	}
+	return originalFailurePayload(raw)
+}
+
+func originalFailurePayload(raw string) string {
+	trimmed := strings.TrimSpace(raw)
+	if trimmed == "" {
+		return canonicalUpstreamError("upstream stream failed")
+	}
+	var value any
+	if json.Unmarshal([]byte(trimmed), &value) == nil {
+		return trimmed
+	}
+	return canonicalUpstreamError(trimmed)
+}
+
+func canonicalUpstreamError(message string) string {
+	return marshalErrorPayload("upstream_error", "upstream_error", message)
+}
+func normalizedServerErrorPayload(message string) string {
+	return marshalErrorPayload("server_error", "server_error", errorMessage(message))
+}
+func marshalErrorPayload(typ, code, message string) string {
+	raw, _ := json.Marshal(map[string]any{"error": map[string]any{"type": typ, "code": code, "message": message}})
+	return string(raw)
+}
+func errorMessage(raw string) string {
+	var value any
+	if json.Unmarshal([]byte(strings.TrimSpace(raw)), &value) == nil {
+		if msg := findMessage(value); msg != "" {
+			return msg
+		}
+	}
+	return strings.TrimSpace(raw)
 }
 
 func hostModelExecute(req pluginapi.ExecutorRequest, body []byte, callbackID string) (pluginapi.HostModelExecutionResponse, error) {
@@ -258,7 +302,6 @@ func hostModelExecute(req pluginapi.ExecutorRequest, body []byte, callbackID str
 	}
 	return resp, nil
 }
-
 func hostModelExecuteStream(req pluginapi.ExecutorRequest, body []byte, callbackID string) (pluginapi.HostModelStreamResponse, error) {
 	raw, err := callHost(pluginabi.MethodHostModelExecuteStream, hostModelRequest(req, body, callbackID))
 	if err != nil {
@@ -270,7 +313,6 @@ func hostModelExecuteStream(req pluginapi.ExecutorRequest, body []byte, callback
 	}
 	return resp, nil
 }
-
 func readHostModelStream(id string) (pluginapi.HostModelStreamReadResponse, error) {
 	raw, err := callHost(pluginabi.MethodHostModelStreamRead, pluginapi.HostModelStreamReadRequest{StreamID: id})
 	if err != nil {
@@ -300,8 +342,7 @@ func isOverloadError(body []byte, status int, err error) bool {
 		return true
 	}
 	if err != nil {
-		s := strings.ToLower(err.Error())
-		return strings.Contains(s, "server_is_overloaded") || strings.Contains(s, "server overloaded") || strings.Contains(s, "overloaded")
+		return valueIsOverloadString(err.Error())
 	}
 	return false
 }
@@ -316,9 +357,17 @@ func isOverloadErrorJSON(body []byte) bool {
 	if json.Unmarshal(body, &value) == nil {
 		return valueIsOverload(value)
 	}
-	return strings.Contains(strings.ToLower(string(body)), "server_is_overloaded")
+	return valueIsOverloadString(string(body))
 }
-
+func valueIsOverloadString(raw string) bool {
+	trimmed := strings.TrimSpace(raw)
+	var value any
+	if json.Unmarshal([]byte(trimmed), &value) == nil && valueIsOverload(value) {
+		return true
+	}
+	lower := strings.ToLower(trimmed)
+	return strings.Contains(lower, "server_is_overloaded") || strings.Contains(lower, "server_overloaded") || strings.Contains(lower, "selected model is at capacity") || strings.Contains(lower, "our servers are currently overloaded") || (strings.Contains(lower, "capacity") && (strings.Contains(lower, "model") || strings.Contains(lower, "server")))
+}
 func waitBackoff(ctx context.Context, attempt int, cfg pluginConfig) error {
 	if cfg.BackoffBaseMS <= 0 {
 		return nil
@@ -347,7 +396,6 @@ func parseSSEFrames(payload []byte) []sseFrame {
 	decoder := &sseDecoder{}
 	return decoder.feed(payload, true)
 }
-
 func decodeSSEFrame(raw []byte) (sseFrame, bool) {
 	var data []byte
 	eventType := ""
@@ -378,49 +426,75 @@ func observeFrame(state *attemptState, frame sseFrame) {
 	if frame.JSON == nil {
 		return
 	}
-	if frameIsOverload(frame) {
-		state.Overloaded = true
-		return
-	}
-	if state.ResponseID == "" {
-		state.ResponseID = responseID(frame.JSON)
-	}
 	if frameIsToolCall(frame) {
 		state.ToolCall = true
+		return
 	}
 	if frameIsGenerated(frame) {
 		state.Generated = true
-		if frameIsTextOutput(frame) {
-			text := frameTextDelta(frame.JSON)
-			if text == "" {
-				return
-			}
-			state.TextOutput = true
-			state.Partial.WriteString(text)
-		}
+		state.SemanticOutput = true
 	}
 }
 func frameIsOverload(frame sseFrame) bool { return valueIsOverload(frame.JSON) }
 func valueIsOverload(value any) bool {
-	m, ok := value.(map[string]any)
-	if !ok {
+	switch v := value.(type) {
+	case map[string]any:
+		if isCapacityCode(stringValue(v["code"])) {
+			return true
+		}
+		if valueIsOverload(v["error"]) || valueIsOverload(v["response"]) {
+			return true
+		}
+		for _, key := range []string{"message", "detail", "error_message"} {
+			if valueIsOverloadString(stringValue(v[key])) {
+				return true
+			}
+		}
+	case []any:
+		for _, item := range v {
+			if valueIsOverload(item) {
+				return true
+			}
+		}
+	case string:
+		return valueIsOverloadString(v)
+	}
+	return false
+}
+func isCapacityCode(code string) bool {
+	switch strings.ToLower(strings.TrimSpace(code)) {
+	case "server_is_overloaded", "server_overloaded", "slow_down", "service_unavailable_error":
+		return true
+	default:
 		return false
 	}
-	if code := strings.ToLower(stringValue(m["code"])); code == "server_is_overloaded" || code == "server_overloaded" {
-		return true
-	}
-	if e, ok := m["error"].(map[string]any); ok && valueIsOverload(e) {
-		return true
-	}
-	if r, ok := m["response"].(map[string]any); ok && valueIsOverload(r) {
-		return true
-	}
-	message := strings.ToLower(stringValue(m["message"]))
-	return strings.Contains(message, "server") && strings.Contains(message, "overload")
 }
+func findMessage(value any) string {
+	switch v := value.(type) {
+	case map[string]any:
+		for _, key := range []string{"message", "detail", "error_message"} {
+			if msg := stringValue(v[key]); msg != "" {
+				return msg
+			}
+		}
+		for _, child := range v {
+			if msg := findMessage(child); msg != "" {
+				return msg
+			}
+		}
+	case []any:
+		for _, child := range v {
+			if msg := findMessage(child); msg != "" {
+				return msg
+			}
+		}
+	}
+	return ""
+}
+
 func frameIsToolCall(frame sseFrame) bool {
 	typ := strings.ToLower(frame.EventType)
-	if strings.Contains(typ, "function_call") || strings.Contains(typ, "tool_call") || strings.Contains(typ, "computer_call") || strings.Contains(typ, "shell_call") || strings.Contains(typ, "custom_tool") || strings.Contains(typ, "tool_search") || strings.Contains(typ, "mcp_call") || strings.Contains(typ, "apply_patch") {
+	if strings.Contains(typ, "call") || strings.Contains(typ, "tool") || strings.Contains(typ, "computer") || strings.Contains(typ, "shell") || strings.Contains(typ, "mcp") || strings.Contains(typ, "apply_patch") {
 		return true
 	}
 	if item, ok := frame.JSON["item"].(map[string]any); ok {
@@ -439,85 +513,79 @@ func toolItemType(typ string) bool {
 }
 func frameIsGenerated(frame sseFrame) bool {
 	typ := strings.ToLower(frame.EventType)
-	return strings.Contains(typ, "output_text.delta") || strings.Contains(typ, "reasoning.delta") || strings.Contains(typ, "content_part.delta") || strings.Contains(typ, "output_text.done") || frameTextDelta(frame.JSON) != ""
+	return strings.Contains(typ, "output_text") || strings.Contains(typ, "reasoning") || strings.Contains(typ, "content_part") || strings.Contains(typ, "image") || strings.Contains(typ, "audio") || containsSemanticKey(frame.JSON)
 }
-
-func frameIsTextOutput(frame sseFrame) bool {
-	typ := strings.ToLower(frame.EventType)
-	return strings.Contains(typ, "output_text") || strings.Contains(typ, "content_part")
-}
-func frameTextDelta(m map[string]any) string {
-	for _, key := range []string{"delta", "text", "output_text"} {
-		if text := stringValue(m[key]); text != "" {
-			return text
+func containsSemanticKey(value any) bool {
+	switch v := value.(type) {
+	case map[string]any:
+		for key, child := range v {
+			lower := strings.ToLower(key)
+			if lower == "encrypted_content" || lower == "output_text" || lower == "text" || lower == "audio" || lower == "image" {
+				if stringValue(child) != "" || child != nil {
+					return true
+				}
+			}
+			if containsSemanticKey(child) {
+				return true
+			}
+		}
+	case []any:
+		for _, child := range v {
+			if containsSemanticKey(child) {
+				return true
+			}
 		}
 	}
-	return ""
+	return false
 }
-func responseID(m map[string]any) string {
-	if response, ok := m["response"].(map[string]any); ok {
-		if id := stringValue(response["id"]); id != "" {
-			return id
-		}
-	}
-	return stringValue(m["response_id"])
-}
-func stringValue(v any) string { s, _ := v.(string); return s }
-
-func rewriteResponseID(raw []byte, id string) []byte {
-	frames := parseSSEFrames(raw)
-	if len(frames) != 1 || frames[0].JSON == nil {
+func rewriteCapacitySSEFrame(raw []byte) []byte {
+	frame, ok := decodeSSEFrame(raw)
+	if !ok || frame.JSON == nil {
 		return raw
 	}
-	obj := frames[0].JSON
-	if response, ok := obj["response"].(map[string]any); ok {
-		response["id"] = id
-	}
-	if _, ok := obj["response_id"]; ok {
-		obj["response_id"] = id
-	}
-	data, err := json.Marshal(obj)
+	rewriteCapacityValue(frame.JSON, false)
+	data, err := json.Marshal(frame.JSON)
 	if err != nil {
 		return raw
 	}
-	old := extractFrameData(raw)
-	if old == nil {
-		return raw
-	}
-	return bytes.Replace(raw, old, append([]byte(" "), data...), 1)
+	return replaceSSEData(raw, data)
 }
-func extractFrameData(raw []byte) []byte {
-	for _, line := range strings.Split(string(raw), "\n") {
-		if strings.HasPrefix(line, "data:") {
-			return []byte(strings.TrimSpace(strings.TrimPrefix(line, "data:")))
+func rewriteCapacityValue(value any, inError bool) {
+	switch v := value.(type) {
+	case map[string]any:
+		if inError {
+			if code, ok := v["code"].(string); ok && isCapacityCode(code) {
+				v["code"] = "server_error"
+			}
+			if typ, ok := v["type"].(string); ok && (isCapacityCode(typ) || strings.EqualFold(typ, "error")) {
+				v["type"] = "server_error"
+			}
+		}
+		for key, child := range v {
+			rewriteCapacityValue(child, inError || strings.EqualFold(key, "error"))
+		}
+	case []any:
+		for _, child := range v {
+			rewriteCapacityValue(child, inError)
 		}
 	}
-	return nil
 }
-
-func buildContinuationBody(original []byte, partial, prompt string) ([]byte, error) {
-	var payload map[string]json.RawMessage
-	if err := json.Unmarshal(original, &payload); err != nil {
-		return nil, fmt.Errorf("request is not a JSON object: %w", err)
-	}
-	if strings.TrimSpace(partial) == "" {
-		return nil, fmt.Errorf("no generated text is available")
-	}
-	var items []json.RawMessage
-	if raw, ok := payload["input"]; ok && len(raw) > 0 && raw[0] == '[' {
-		if err := json.Unmarshal(raw, &items); err != nil {
-			return nil, fmt.Errorf("decode input: %w", err)
+func replaceSSEData(raw, data []byte) []byte {
+	lines := strings.SplitAfter(string(raw), "\n")
+	for i, line := range lines {
+		trimmed := strings.TrimSuffix(strings.TrimSuffix(line, "\n"), "\r")
+		if strings.HasPrefix(trimmed, "data:") {
+			prefix := line[:strings.Index(line, "data:")+len("data:")]
+			suffix := ""
+			if strings.HasSuffix(line, "\r\n") {
+				suffix = "\r\n"
+			} else if strings.HasSuffix(line, "\n") {
+				suffix = "\n"
+			}
+			lines[i] = prefix + " " + string(data) + suffix
+			return []byte(strings.Join(lines, ""))
 		}
-	} else if raw, ok := payload["input"]; ok {
-		var text string
-		if json.Unmarshal(raw, &text) != nil {
-			return nil, fmt.Errorf("input must be a string or array")
-		}
-		items = append(items, mustJSON(map[string]any{"type": "message", "role": "user", "content": text}))
 	}
-	items = append(items, mustJSON(map[string]any{"type": "message", "role": "assistant", "content": partial}), mustJSON(map[string]any{"type": "message", "role": "user", "content": prompt}))
-	payload["input"] = mustJSON(items)
-	payload["stream"] = mustJSON(true)
-	return json.Marshal(payload)
+	return raw
 }
-func mustJSON(v any) json.RawMessage { raw, _ := json.Marshal(v); return raw }
+func stringValue(v any) string { s, _ := v.(string); return s }

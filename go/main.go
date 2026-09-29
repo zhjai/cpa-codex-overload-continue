@@ -54,8 +54,8 @@ import (
 	"sync/atomic"
 	"unsafe"
 
-	"github.com/router-for-me/CLIProxyAPI/v7/sdk/pluginabi"
-	"github.com/router-for-me/CLIProxyAPI/v7/sdk/pluginapi"
+	"github.com/router-for-me/CLIProxyAPI/v8/sdk/pluginabi"
+	"github.com/router-for-me/CLIProxyAPI/v8/sdk/pluginapi"
 	"gopkg.in/yaml.v3"
 )
 
@@ -91,13 +91,10 @@ type pluginConfig struct {
 	Enabled             bool     `yaml:"enabled"`
 	Provider            string   `yaml:"provider"`
 	Models              []string `yaml:"models"`
-	MaxPreCommitRetries int      `yaml:"max_pre_commit_retries"`
-	MaxContinuations    int      `yaml:"max_continuations"`
+	PostOutputCapacity  string   `yaml:"post_output_capacity"`
+	MaxPreOutputRetries int      `yaml:"max_pre_output_retries"`
 	BackoffBaseMS       int      `yaml:"backoff_base_ms"`
 	BackoffMaxMS        int      `yaml:"backoff_max_ms"`
-	ContinuationMode    string   `yaml:"continuation_mode"`
-	ContinuePrompt      string   `yaml:"continue_prompt"`
-	RewriteResponseID   bool     `yaml:"rewrite_response_id"`
 }
 
 var currentConfig atomic.Value
@@ -144,13 +141,10 @@ func defaultConfig() pluginConfig {
 	return pluginConfig{
 		Enabled:             false,
 		Provider:            "codex",
-		MaxPreCommitRetries: 2,
-		MaxContinuations:    1,
+		PostOutputCapacity:  "fail_closed",
+		MaxPreOutputRetries: 0,
 		BackoffBaseMS:       250,
 		BackoffMaxMS:        4000,
-		ContinuationMode:    "disabled",
-		ContinuePrompt:      "Continue exactly where you stopped. Do not repeat text already produced; finish the response.",
-		RewriteResponseID:   true,
 	}
 }
 
@@ -165,33 +159,44 @@ func loadedConfig() pluginConfig {
 
 func configure(raw []byte) error {
 	cfg := defaultConfig()
+	var configYAML []byte
 	if len(raw) > 0 {
 		var req lifecycleRequest
 		if err := json.Unmarshal(raw, &req); err != nil {
 			return err
 		}
-		if len(req.ConfigYAML) > 0 {
-			if err := yaml.Unmarshal(req.ConfigYAML, &cfg); err != nil {
-				return err
+		configYAML = req.ConfigYAML
+	}
+	if len(configYAML) > 0 {
+		var fields map[string]any
+		if err := yaml.Unmarshal(configYAML, &fields); err != nil {
+			return err
+		}
+		for _, legacy := range []string{"max_pre_commit_retries", "max_continuations", "continuation_mode", "continue_prompt", "rewrite_response_id"} {
+			if _, exists := fields[legacy]; exists {
+				return fmt.Errorf("legacy field %q is not supported; use post_output_capacity and max_pre_output_retries", legacy)
 			}
+		}
+		if err := yaml.Unmarshal(configYAML, &cfg); err != nil {
+			return err
 		}
 	}
 	if cfg.Provider == "" {
 		cfg.Provider = "codex"
 	}
 	cfg.Provider = strings.ToLower(strings.TrimSpace(cfg.Provider))
-	cfg.ContinuationMode = strings.ToLower(strings.TrimSpace(cfg.ContinuationMode))
-	if cfg.ContinuationMode == "" {
-		cfg.ContinuationMode = "text"
+	cfg.PostOutputCapacity = strings.ToLower(strings.TrimSpace(cfg.PostOutputCapacity))
+	if cfg.PostOutputCapacity == "" {
+		cfg.PostOutputCapacity = "fail_closed"
 	}
-	if cfg.ContinuationMode != "disabled" && cfg.ContinuationMode != "text" {
-		return fmt.Errorf("continuation_mode must be disabled or text")
+	if cfg.PostOutputCapacity != "fail_closed" && cfg.PostOutputCapacity != "text_only" {
+		return fmt.Errorf("post_output_capacity must be fail_closed or text_only")
 	}
-	if cfg.MaxPreCommitRetries < 0 || cfg.MaxPreCommitRetries > 5 {
-		return fmt.Errorf("max_pre_commit_retries must be between 0 and 5")
+	if cfg.MaxPreOutputRetries < 0 || cfg.MaxPreOutputRetries > 1 {
+		return fmt.Errorf("max_pre_output_retries must be between 0 and 1")
 	}
-	if cfg.MaxContinuations < 0 || cfg.MaxContinuations > 1 {
-		return fmt.Errorf("max_continuations must be 0 or 1")
+	if cfg.Enabled && len(cfg.Models) == 0 {
+		return fmt.Errorf("models must be non-empty when the plugin is enabled")
 	}
 	if cfg.BackoffBaseMS < 0 || cfg.BackoffMaxMS < cfg.BackoffBaseMS {
 		return fmt.Errorf("invalid backoff bounds")
@@ -207,19 +212,16 @@ func pluginRegistration() registration {
 	return registration{
 		SchemaVersion: pluginabi.SchemaVersion,
 		Metadata: pluginapi.Metadata{
-			Name: pluginIdentifier, Version: "0.1.0", Author: "zhjai",
+			Name: pluginIdentifier, Version: "0.2.0", Author: "zhjai",
 			GitHubRepository: "https://github.com/zhjai/cpa-codex-overload-continue",
 			ConfigFields: []pluginapi.ConfigField{
 				{Name: "enabled", Type: pluginapi.ConfigFieldTypeBoolean, Description: "Enable the opt-in Codex overload recovery router."},
 				{Name: "provider", Type: pluginapi.ConfigFieldTypeString, Description: "Provider forced for nested execution; normally codex."},
 				{Name: "models", Type: pluginapi.ConfigFieldTypeArray, Description: "Model allowlist. Empty matches every openai-response model."},
-				{Name: "max_pre_commit_retries", Type: pluginapi.ConfigFieldTypeInteger, Description: "Retries when overload happens before generated output is committed."},
-				{Name: "max_continuations", Type: pluginapi.ConfigFieldTypeInteger, Description: "At most one text-only continuation is supported."},
+				{Name: "post_output_capacity", Type: pluginapi.ConfigFieldTypeEnum, EnumValues: []string{"fail_closed", "text_only"}, Description: "Post-output capacity handling. text_only rewrites only safe text responses; fail_closed preserves the upstream error."},
+				{Name: "max_pre_output_retries", Type: pluginapi.ConfigFieldTypeInteger, Description: "Optional plugin-level retries before any stream chunk is forwarded; CPA host buffering/failover remains preferred."},
 				{Name: "backoff_base_ms", Type: pluginapi.ConfigFieldTypeInteger, Description: "Initial retry backoff in milliseconds."},
 				{Name: "backoff_max_ms", Type: pluginapi.ConfigFieldTypeInteger, Description: "Maximum retry backoff in milliseconds."},
-				{Name: "continuation_mode", Type: pluginapi.ConfigFieldTypeEnum, EnumValues: []string{"disabled", "text"}, Description: "Text-only continuation; tool-call turns always fail closed."},
-				{Name: "continue_prompt", Type: pluginapi.ConfigFieldTypeString, Description: "Prompt appended to a safe text-only continuation."},
-				{Name: "rewrite_response_id", Type: pluginapi.ConfigFieldTypeBoolean, Description: "Reuse the first response id on continuation events when possible."},
 			},
 		},
 		Capabilities: registrationCaps{
